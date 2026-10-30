@@ -2,6 +2,13 @@
 """xStudio Connection API.
 
 Controls xStudio connections.
+
+Example::
+
+    from xstudio.connection import Connection
+
+    with Connection(auto_connect=True) as conn:
+        print(conn.api.session.name)
 """
 
 from xstudio.core import absolute_receive_timeout
@@ -12,12 +19,43 @@ from xstudio.core import error, Link, JsonStore
 from xstudio.core import XSTUDIO_LOCAL_PLUGIN_PATH
 from xstudio.api import API
 from xstudio.core import RemoteSessionManager, remote_session_path
-import uuid
-import time
+import importlib.util
+import json
+import logging
 import os
-import traceback
+import sys
+import threading
+import time
+import uuid
 from pathlib import Path
-from threading import Thread
+
+logger = logging.getLogger(__name__)
+
+# How long stop_background_processing waits for the event thread. The thread
+# blocks in Link.wait_for_xstudio_exit, which only returns when xStudio exits,
+# so it can't be interrupted and is left to finish as a daemon thread.
+_THREAD_JOIN_TIMEOUT_S = 0.1
+
+
+class XStudioConnectionError(RuntimeError, ConnectionError):
+    """Raised when a connection to xStudio cannot be established.
+
+    Subclasses RuntimeError for compatibility with code written against
+    earlier versions, and the builtin ConnectionError.
+    """
+
+
+class AuthenticationError(XStudioConnectionError):
+    """Raised when xStudio rejects the supplied credentials."""
+
+
+class XStudioTimeoutError(TimeoutError, RuntimeError):
+    """Raised when xStudio does not respond in time.
+
+    Subclasses RuntimeError for compatibility with code written against
+    earlier versions, and the builtin TimeoutError.
+    """
+
 
 class Connection(object):
     """Handle connection to xstudio."""
@@ -29,16 +67,23 @@ class Connection(object):
 
         Kwargs:
            auto_connect (bool): Connect on creation.
-           background_processing (bool): Spawn thread on connection to monitor queue..
+           background_processing (bool): Spawn thread on connection to monitor queue.
            debug (bool): Output debug information.
+           load_python_plugins (bool): Load python plugins on creation.
         """
-        self.link = Link()
+        # Set before anything that can raise so __del__ is always safe.
         self.connected = False
+        self.queue_thread = None
+        self.plugins = {}
+
+        self.link = Link()
         self.app_type = None
         self.app_version = None
         self._api = None
         self.default_timeout_ms = 10000
         self.debug = debug
+        if debug:
+            logger.setLevel(logging.DEBUG)
 
         self.responses = {}
 
@@ -47,7 +92,6 @@ class Connection(object):
         self.keep_processing = True
         self.background_processing = background_processing
 
-        self.plugins = {}
         self.hud_plugins = {}
         self.__last_hud_data_media_items = None
         self.__last_hud_data = None
@@ -58,6 +102,18 @@ class Connection(object):
         if load_python_plugins:
             self.load_python_plugins()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, tb):
+        self.disconnect()
+        return False
+
+    def __repr__(self):
+        if self.connected:
+            return "<Connection {} {} {}:{}>".format(
+                self.app_type, self.app_version, self.host, self.port)
+        return "<Connection disconnected>"
 
     def enable_background_processing(self, state=True):
         """Enable auto background processing of queue.
@@ -70,7 +126,7 @@ class Connection(object):
         if self.background_processing:
             self.start_background_processing()
         else:
-           self.stop_background_processing()
+            self.stop_background_processing()
 
     def api_handler(self, sender, req_id, event):
         """Handler for API exit.
@@ -90,17 +146,32 @@ class Connection(object):
     def add_event_callback(self, remote, handler):
         """Add a callback function to recieve event broadcasts from some actor
 
+        Unlike :meth:`add_handler`, the callback is invoked by xStudio itself
+        and does not require this connection to process events.
+
         Args:
            remote (Actor): Owner of broadcast actor.
            handler (func(sender, req_id, event)): Handler to install.
 
         Returns:
-            handler_id(str): Handler Id.
+            handler_id(Uuid): Handler Id.
         """
         agrp = self.get_broadcast(remote)
         return self.link.add_message_callback(
                 agrp, handler
             )
+
+    def remove_event_callback(self, handler_id):
+        """Remove a callback added with :meth:`add_event_callback`.
+
+        Args:
+           handler_id (Uuid): Id returned by add_event_callback.
+
+        Returns:
+            result(bool): Success.
+        """
+        self.link.remove_message_callback(handler_id)
+        return True
 
     def add_handler(self, remote, handler):
         """Add handler to remote broadcasts.
@@ -113,7 +184,8 @@ class Connection(object):
             handler_id(str): Handler Id.
         """
         agrp = self.get_broadcast(remote)
-        self.join_broadcast(agrp)
+        if not self.join_broadcast(agrp):
+            raise RuntimeError("Failed to join broadcast for {}".format(remote))
         return self.add_broadcast_handler(agrp, remote, handler)
 
     # should use get_event_group...
@@ -124,7 +196,7 @@ class Connection(object):
            remote (Actor): Target actor.
 
         Returns:
-            broadcast(Actor): Broadcast actore for remote.
+            broadcast(Actor): Broadcast actor for remote.
         """
         return self.request_receive(remote, get_event_group_atom())[0]
 
@@ -149,13 +221,16 @@ class Connection(object):
         """Leave broadcast.
 
         Args:
-           broadcast (Actor): Millisecs to process for.
+           broadcast (Actor): Broadcast actor.
            send_leave (bool): Notify actor we're leaving.
         """
+        broadcast_key = str(broadcast)
+        if broadcast_key not in self.broadcast_channel:
+            return
+
         if send_leave:
             self.request_receive(broadcast, leave_broadcast_atom())
 
-        broadcast_key = str(broadcast)
         for i in list(self.broadcast_channel[broadcast_key].keys()):
             self.remove_handler(i)
         del self.broadcast_channel[broadcast_key]
@@ -199,14 +274,10 @@ class Connection(object):
 
         if broadcast not in self.broadcast_channel:
             raise RuntimeError("Join broadcast first")
-            # self.broadcast_channel[broadcast] = {}
-
-        if sender not in self.broadcast_handlers:
-            self.broadcast_handlers[sender] = {}
 
         result = str(uuid.uuid4())
 
-        self.broadcast_handlers[sender][result] = handler
+        self.broadcast_handlers.setdefault(sender, {})[result] = handler
         self.broadcast_channel[broadcast][result] = handler
 
         return result
@@ -221,18 +292,25 @@ class Connection(object):
             result(bool): Success.
         """
         result = False
-        for i in self.broadcast_handlers.keys():
-            if handler_id in self.broadcast_handlers[i]:
-                del self.broadcast_handlers[i][handler_id]
+        for handlers in self.broadcast_handlers.values():
+            if handlers.pop(handler_id, None) is not None:
                 result = True
                 break
 
-        for i in self.broadcast_channel.keys():
-            if handler_id in self.broadcast_channel[i]:
-                del self.broadcast_channel[i][handler_id]
+        for handlers in self.broadcast_channel.values():
+            if handlers.pop(handler_id, None) is not None:
                 result = True
                 break
         return result
+
+    def _call_handlers(self, handlers, sender, req_id, event):
+        # Iterate over a snapshot, handlers may add or remove handlers.
+        for handler in list(handlers.values()):
+            try:
+                handler(sender, req_id, event)
+            except Exception:
+                # One bad handler must not kill event processing.
+                logger.exception("Error in broadcast handler %s", handler)
 
     # can include broadcast down..
     def handle_broadcast(self, event):
@@ -244,31 +322,26 @@ class Connection(object):
         req_id = event[-2]
         sender = event[-1]
         sender_key = str(sender)
+        payload = event[:-2]
 
         if sender_key in self.broadcast_handlers:
-            for i in self.broadcast_handlers[sender_key].keys():
-                self.broadcast_handlers[sender_key][i](sender, req_id, event[:len(event)-2])
+            self._call_handlers(self.broadcast_handlers[sender_key], sender, req_id, payload)
         elif sender_key in self.broadcast_channel:
-            for i in self.broadcast_channel[sender_key].keys():
-                self.broadcast_channel[sender_key][i](sender, req_id, event[:len(event)-2])
+            self._call_handlers(self.broadcast_channel[sender_key], sender, req_id, payload)
 
             # remove callbacks to down broadcaster
             if len(event) == 3 and type(event[0]) == type(broadcast_down_atom()):
                 self.leave_broadcast(sender, False)
         else:
-            pass
-            # print("ignored broadcast", sender, req_id, event[:len(event)-2])
+            logger.debug("Ignored broadcast %s %s %s", sender, req_id, payload)
 
     def get_authentication_from_stdin(self):
-        """Request lock key from user.
-
-        Args:
-           lock (str): Lock name.
+        """Request credentials from user.
 
         Returns:
             user_input(str): String entered by user.
         """
-        return input("Enter script key or user<SPACE>password for remote session {}:{}: ".format(self.link.host, self.link.port))
+        return input("Enter script key or user<SPACE>password for remote session {}:{}: ".format(self.host, self.port))
 
     def connect_local(self, actor):
         """Connect to in-process actor.
@@ -277,17 +350,15 @@ class Connection(object):
            actor (actor): Actor object.
         """
         self.disconnect()
-        connected = self.link.connect_local(actor)
-        if connected:
-            self.negotiate()
-        else:
-            raise RuntimeError("Failed to connect")
+        if not self.link.connect_local(actor):
+            raise XStudioConnectionError("Failed to connect to local actor")
+        self.negotiate()
 
     def connect_remote_auto(self, session=None, authentication_callback=None):
         """Connect to xStudio using session file.
 
         Kwargs:
-           session (str): Session name.
+           session (str): Session name, if None the first API session is used.
            authentication_callback (func): Callback for authentication.
         """
         r = RemoteSessionManager(remote_session_path())
@@ -295,6 +366,12 @@ class Connection(object):
             s = r.first_api()
         else:
             s = r.find(session)
+
+        if s is None:
+            if session is None:
+                raise XStudioConnectionError("No remote xStudio session found in {}".format(remote_session_path()))
+            raise XStudioConnectionError("Remote xStudio session '{}' not found in {}".format(session, remote_session_path()))
+
         self.connect_remote(s.host(), s.port(), authentication_callback)
 
     def connect_remote(self, host, port, authentication_callback=None):
@@ -311,11 +388,9 @@ class Connection(object):
             authentication_callback = self.get_authentication_from_stdin
 
         self.disconnect()
-        connected = self.link.connect_remote(host, port)
-        if connected:
-            self.negotiate(authentication_callback)
-        else:
-            raise RuntimeError("Failed to connect")
+        if not self.link.connect_remote(host, int(port)):
+            raise XStudioConnectionError("Failed to connect to {}:{}".format(host, port))
+        self.negotiate(authentication_callback)
 
     def negotiate(self, authentication_callback=None):
         """Negotiate connection, also handles authentication.
@@ -326,20 +401,25 @@ class Connection(object):
         self.app_version = self.request_receive(self.link.remote(), version_atom())[0]
         self.app_type = self.request_receive(self.link.remote(), get_application_mode_atom())[0]
 
-
         try:
             self.link.set_remote(self.request_receive(self.link.remote(), authenticate_atom())[0])
-        except:
-            if authentication_callback:
-                auth = authentication_callback().split()
-                if len(auth) == 2:
-                    self.link.set_remote(self.request_receive(self.link.remote(), authenticate_atom(), auth[0], auth[1])[0])
-                elif len(auth) == 1:
-                    self.link.set_remote(self.request_receive(self.link.remote(), authenticate_atom(), auth[0])[0])
-                else:
-                    raise
-            else:
+        except XStudioTimeoutError:
+            raise
+        except RuntimeError as e:
+            # Unauthenticated access was refused, ask for credentials.
+            if not authentication_callback:
+                raise AuthenticationError(str(e)) from e
+
+            # Split once so passwords may contain spaces.
+            auth = (authentication_callback() or "").strip().split(None, 1)
+            if not auth:
+                raise AuthenticationError("No credentials supplied") from e
+            try:
+                self.link.set_remote(self.request_receive(self.link.remote(), authenticate_atom(), *auth)[0])
+            except XStudioTimeoutError:
                 raise
+            except RuntimeError as auth_error:
+                raise AuthenticationError(str(auth_error)) from auth_error
 
         self.connected = True
 
@@ -356,21 +436,27 @@ class Connection(object):
 
     def stop_background_processing(self):
         """Stop event processing thread."""
-        try:
-            self.stop_processing_events()
-            self.queue_thread.join()
-        except:
-            pass
+        thread = self.queue_thread
+        if thread is None:
+            return
+        self.stop_processing_events()
+        # disconnect() may be triggered from a handler running on the thread.
+        if thread is not threading.current_thread():
+            thread.join(_THREAD_JOIN_TIMEOUT_S)
+        self.queue_thread = None
 
     def start_background_processing(self):
         """Start event processing thread."""
         self.stop_background_processing()
-        self.queue_thread = Thread(target=self.process_events_forever)
+        self.queue_thread = threading.Thread(
+            target=self.process_events_forever, name="xstudio-events", daemon=True)
         self.queue_thread.start()
 
-
     def __del__(self):
-        self.disconnect()
+        try:
+            self.disconnect()
+        except Exception:
+            pass
 
     def remote(self):
         """Remote connection object.
@@ -388,8 +474,19 @@ class Connection(object):
         return self.request_receive_timeout(self.default_timeout_ms, *args)
 
     def request_receive_timeout(self, timeout_milli, *args):
-        """Send message and return response."""
-        return self.link.request(timeout_milli, *args)
+        """Send message and return response.
+
+        Raises:
+            XStudioTimeoutError: No response within timeout_milli.
+            RuntimeError: The remote actor replied with an error.
+        """
+        try:
+            return self.link.request(int(timeout_milli), *args)
+        except RuntimeError as e:
+            if str(e) == "Dequeue timeout":
+                raise XStudioTimeoutError(
+                    "No response from xStudio within {}ms".format(timeout_milli)) from None
+            raise
 
     def spawn(self, *args):
         """Spawn remote actor
@@ -431,9 +528,7 @@ class Connection(object):
         while True:
             try:
                 self._dequeue_messages(timeout)
-            except (TimeoutError, SystemError) as e:
-                break
-            except TimeoutError as e:
+            except (TimeoutError, SystemError):
                 break
 
     def _dequeue_messages(self, timeout_milli, watch_for = None):
@@ -442,24 +537,27 @@ class Connection(object):
         Kwargs:
            timeout_milli (int): Milliseconds timeout.
         """
-        start = time.perf_counter()
+        deadline = time.monotonic() + timeout_milli / 1000.0
 
         if watch_for and watch_for in self.responses and self.responses[watch_for] is not None:
             return
 
         while True:
 
+            remaining_ms = (deadline - time.monotonic()) * 1000.0
+            if remaining_ms <= 0:
+                break
+
             try:
                 msg = self.link.dequeue_message_with_timeout(
-                    absolute_receive_timeout(int(5000))
+                    absolute_receive_timeout(max(int(remaining_ms), 1))
                 )
             except Exception as e:
                 if str(e) == "Dequeue timeout":
-                    raise TimeoutError("Dequeue timeout")
-                else:
-                    raise
+                    raise TimeoutError("Dequeue timeout") from None
+                raise
 
-            if msg is None:
+            if not msg:
                 raise TimeoutError("Dequeue timeout")
 
             # response so add to map..
@@ -473,24 +571,20 @@ class Connection(object):
                 # assumed a brocast msg.. May not be..
                 self.handle_broadcast(msg)
 
-            # handle non responses
-
-            # exit loop if we've exceeded timeout
-            elapsed = (time.perf_counter() - start) * 1000
-            if elapsed > timeout_milli:
-                break
-            timeout_milli -= elapsed
-
     def disconnect(self):
         """Disconnect from xstudio"""
-        for plugin_name in self.plugins:
-            self.plugins[plugin_name].cleanup()
+        for plugin_name, plugin in list(self.plugins.items()):
+            try:
+                plugin.cleanup()
+            except Exception:
+                logger.exception("Error cleaning up plugin %s", plugin_name)
         self.app_type = None
         self.app_version = None
         self._api = None
         self.connected = False
         self.stop_background_processing()
-        self.link.disconnect()
+        if hasattr(self, "link"):
+            self.link.disconnect()
 
     @property
     def api(self):
@@ -535,12 +629,14 @@ class Connection(object):
         # installed/deployed as part of xstudio app bundle
         self.load_plugins_in_path(XSTUDIO_LOCAL_PLUGIN_PATH)
 
+        if not self.connected:
+            return
+
         try:
 
-            # use python_plugin_search_folders and 
+            # use python_plugin_search_folders and
             # user_python_plugin_search_folders prefs to scan for python plugins
 
-            import json
             extra_paths = json.loads(
                 self.api.global_store.value(
                     "/core/python/python_plugin_search_folders").dump()
@@ -553,9 +649,8 @@ class Connection(object):
             for extra_path in extra_paths:
                 self.load_plugins_in_path(extra_path)
 
-        except Exception as e:
-            print("Error in load_python_plugins: {}".format(e))
-
+        except Exception:
+            logger.exception("Error in load_python_plugins")
 
     def load_plugins_in_path(self, path):
         """Load plugins found under the given directoy path
@@ -564,14 +659,14 @@ class Connection(object):
             path (str): Path to a directory on filesystem
         """
 
-        path = os.path.expandvars(path.strip())
-        if not os.path.isdir(path):
+        path = os.path.expandvars(os.path.expanduser(str(path).strip()))
+        if not path or not os.path.isdir(path):
             # silently ignore invalid paths, this is accepted behaviour for
             # search path mechanisms
             return
 
-        for p in Path(path).iterdir():
-            if p.is_dir():
+        for p in sorted(Path(path).iterdir()):
+            if p.is_dir() and not p.name.startswith((".", "__")):
                 self.load_plugin_from_path(path, p.name)
 
     def load_plugin_from_path(self, path, plugin_name):
@@ -579,61 +674,66 @@ class Connection(object):
 
         Args:
             path (Path): Path to a directory on filesystem
+            plugin_name (str): Name of python package within path
         """
+        key = str(path) + plugin_name
+        if key in self.plugins:
+            # already loaded, e.g. path listed in more than one search path
+            return
+
         try:
-
-            import importlib.util
-            import sys
-
-            sys.path.insert(0, path)
+            path = str(path)
+            if path not in sys.path:
+                sys.path.insert(0, path)
             spec = importlib.util.find_spec(plugin_name)
-            if spec is not None:
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[plugin_name] = module
-                spec.loader.exec_module(module)
-                plugin_instance = module.create_plugin_instance(self)
-                self.plugins[str(path) + plugin_name] = plugin_instance
-                from xstudio.plugin.hud_plugin import HUDPlugin
-                if isinstance(plugin_instance, HUDPlugin):
-                    self.hud_plugins[plugin_instance.uuid] = plugin_instance
+            if spec is None:
+                logger.error("Error loading plugin \"%s\" from \"%s\" - not python importable.", plugin_name, path)
+                return
 
-            else:
-                print ("Error loading plugin \"{0}\" from \"{1}\" - not python importable.".format(
-                    plugin_name, path))
-        except Exception as e:
-            print ("Failed to load plugin {0} from location {1} with error {2}".format(plugin_name, path, e))
-            print (traceback.format_exc())
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[plugin_name] = module
+            spec.loader.exec_module(module)
+            if not hasattr(module, "create_plugin_instance"):
+                logger.error("Plugin \"%s\" from \"%s\" has no create_plugin_instance function.", plugin_name, path)
+                return
+
+            plugin_instance = module.create_plugin_instance(self)
+            self.plugins[key] = plugin_instance
+            from xstudio.plugin.hud_plugin import HUDPlugin
+            if isinstance(plugin_instance, HUDPlugin):
+                self.hud_plugins[plugin_instance.uuid] = plugin_instance
+
+        except Exception:
+            logger.exception("Failed to load plugin %s from location %s", plugin_name, path)
 
     def get_plugin_instance(self, plugin_uuid):
         """Used internally to enable callbacks between QML UI code and
         backend python plugins"""
 
-        for pn in self.plugins:
-            if self.plugins[pn].uuid == plugin_uuid:
-                return self.plugins[pn]
-        raise Exception("Plugin with uuid {} was not found".format(plugin_uuid))
+        for plugin in self.plugins.values():
+            if plugin.uuid == plugin_uuid:
+                return plugin
+        raise KeyError("Plugin with uuid {} was not found".format(plugin_uuid))
 
     def hud_plugins_onscreen_data(self, media_items):
         """This method is called by the xstudio offscreen viewport(s) when they
         need to render overlay data accurately (e.g. when doing a snapshot or
         video output render). We call HUD Plugin instances, passing in the media
-        item that is on-screen. The HUD Plugin returns a JSON struct that 
+        item that is on-screen. The HUD Plugin returns a JSON struct that
         contains whatever data it needs to do the overlay graphics. The offscreen
         viewport then uses this data to set a special QML property that can
         then be used to drive the QML graphics element provided by the HUD plugin.
         """
-        if self.__last_hud_data_media_items == media_items:
+        if self.__last_hud_data is not None and self.__last_hud_data_media_items == media_items:
             return self.__last_hud_data
-        result = {}        
+        result = {}
         for plugin_id, plugin in self.hud_plugins.items():
-            result[plugin_id] = []
-            idx = 0
-            for media_item in media_items:
-                result[plugin_id].append(plugin.media_item_hud_data_rw(media_item))
-                idx+=1
+            result[plugin_id] = [
+                plugin.media_item_hud_data_rw(media_item) for media_item in media_items
+            ]
         self.__last_hud_data_media_items = media_items
         self.__last_hud_data = JsonStore(result)
-        return JsonStore(result)
+        return self.__last_hud_data
 
     def get_named_python_plugin_instance(self, plugin_name):
         """Use this to retrieve the Plugin class instance for a given named
@@ -646,7 +746,7 @@ class Connection(object):
             plugin(PluginBase): the Python object, the plugin instance
         """
 
-        for pn in self.plugins:
-            if self.plugins[pn].name == plugin_name:
-                return self.plugins[pn]
-        raise Exception("Plugin with name {} was not found".format(plugin_name))
+        for plugin in self.plugins.values():
+            if plugin.name == plugin_name:
+                return plugin
+        raise KeyError("Plugin with name {} was not found".format(plugin_name))
