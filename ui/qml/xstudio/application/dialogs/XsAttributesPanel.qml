@@ -35,7 +35,7 @@ XsWindow {
     property bool self_destroy: false
 
     onVisibleChanged: {
-        if (!visible) {
+        if (!visible && self_destroy) {
             destroy()
         }
     }

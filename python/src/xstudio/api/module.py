@@ -337,6 +337,10 @@ class ModuleBase(ActorConnection, metaclass=ModuleMeta):
         Args:
             attribute_uuid(Uuid): Uuid of the attribute to be removed
         """
+        attr = self.attrs_by_uuid_.pop(attribute_uuid, None)
+        if attr:
+            self.attrs_by_name_.pop(attr.name, None)
+
         return self.connection.request_receive(
                 self.remote,
                 remove_attribute_atom(),

@@ -27,7 +27,9 @@ Item {
             property var dynamic_widget
             property var widget_visible: dynamic_widget ? dynamic_widget.visible : false
 
-            onSourceChanged: {
+            onSourceChanged: makeWidget()
+
+            function makeWidget() {
                 if (typeof source != "string" || dynamic_widget) return
                 if (source.endsWith(".qml")) {
                     let component = Qt.createComponent(source)
@@ -44,9 +46,11 @@ Item {
             }
 
             onItemEnabledChanged: {
-                if (itemEnabled && dynamic_widget) {
-                    dynamic_widget.visible = true
-                }
+                if (!itemEnabled) return
+                // the widget may have destroyed itself when it was closed,
+                // in which case we need to build it again
+                if (!dynamic_widget) makeWidget()
+                if (dynamic_widget) dynamic_widget.visible = true
             }
 
             onWidget_visibleChanged: {
